@@ -1,0 +1,70 @@
+
+float3 linear_to_srgb(float3 linear) {
+    float3 a = 12.92 * linear;
+    float3 b = 1.055 * pow(linear, float3(1.0 / 2.4)) - 0.055;
+    float3 c = step(float3(0.0031308), linear);
+    return lerp(a, b, c);
+}
+
+float find_t(char shape, float focal_point, float2 uv) {
+    if (shape == 0) {
+        // linear
+        return uv.x;
+    } if (shape == 1) {
+        // radial
+        return length(uv * 2.0 - 1.0);
+    } else {
+        // focal
+        uv = uv * 2.0 - 1.0;
+        float2 d = float2(focal_point, 0.0);
+        float l = length(d);
+        d = d / l;
+        return l / (sqrt(1.0 - focal_point * focal_point * d.y * d.y) + focal_point * d.x);
+    }
+}
+
+float4 main(
+    float4 vPosition: POSITION,
+    float2 vTexCoord: TEXCOORD0,
+
+    uniform float4 multColor,
+    uniform float4 addColor,
+
+    uniform float focal_point,
+    uniform char3 gradient,
+    uniform sampler2D texSampler: TEXUNIT0
+) : COLOR0 {
+    // Calculate normalized `t` position in gradient, [0.0, 1.0] being the bounds of the ratios.
+    // gradient.y = shape
+    float t = find_t(gradient.y, focal_point, vTexCoord);
+
+    // gradient.z = repeat
+    if(gradient.z == 0) {
+        // Pad
+        t = saturate(t);
+    } else if(gradient.z == 1) {
+        // Reflect
+        if( t < 0.0 ) {
+            t = -t;
+        }
+        if( int(fmod(t, 2.0)) == 0 ) {
+            t = frac(t);
+        } else {
+            t = 1.0 - frac(t);
+        }
+    } else if(gradient.z == 2) {
+        // Repeat
+        t = frac(t);
+    }
+
+    float4 color = tex2D(texSampler, float2(t, 0.0));
+    // gradient.x = interpolation
+    if(gradient.x != 0) {
+        color.rgb = linear_to_srgb(color.rgb);
+    }
+
+// temp
+    color = saturate(color + (multColor + addColor)/10000.);
+    float alpha = saturate(color.a);
+    return float4(color.rgb * alpha, alpha);
+}

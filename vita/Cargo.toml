@@ -1,0 +1,28 @@
+[package]
+name = "ruffle_vita"
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ruffle_render = { path = "../render" }
+ruffle_render_gxm = { path = "../render/gxm" }
+ruffle_video_software = { path = "../video/software" }
+ruffle_frontend_utils = { path = "../frontend-utils", features = ["cpal"] }
+ruffle_core = { path = "../core", features = ["audio", "clap", "mp3", "aac", "nellymoser", "default_compatibility_rules"] }
+vitasdk-sys = { version = "0.3.3", features = ["SceKernelModulemgr_stub", "SceLibKernel_stub", "SceAudio_stub"] }
+
+[package.metadata.vita]
+title_id = "RUFFLE000"
+title_name = "Ruffle"
+assets = "static"
+vita_mksfoex_flags = []
+
+[package.metadata.vita.profile.release]
+strip_symbols = false

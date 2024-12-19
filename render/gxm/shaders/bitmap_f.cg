@@ -1,0 +1,18 @@
+void main(
+    float2 vTexCoord: TEXCOORD0,
+
+    uniform float4 multColor,
+    uniform float4 addColor,
+    uniform sampler2D texSampler: TEXUNIT0,
+
+    out float4 fragColor: COLOR0
+) {
+    fragColor = tex2D(texSampler, vTexCoord);
+
+    // Unmultiply alpha before applying color transform.
+    if (fragColor.a > 0.0) {
+        fragColor.rgb /= fragColor.a;
+        fragColor = saturate(multColor * fragColor + addColor);
+        fragColor.rgb = fragColor.rgb * saturate(fragColor.a);
+    }
+}

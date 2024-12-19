@@ -1,0 +1,8 @@
+void main(
+    float2 aPosition: POSITION,
+	unsigned char4 aColor: COLOR,
+
+    float4 out vPosition: POSITION
+) {
+    vPosition = float4(aPosition, 0.0, 1.0);
+}

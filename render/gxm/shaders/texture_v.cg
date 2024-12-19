@@ -1,0 +1,14 @@
+void main(
+    float2 aPosition: POSITION,
+    unsigned char4 aColor: COLOR,
+
+    uniform float4x4 worldMatrix,
+    uniform float4x4 viewMatrix,
+    uniform float3x3 uMatrix,
+
+    out float4 vPosition: POSITION,
+    out float2 vTexCoord: TEXCOORD0
+) {
+    vTexCoord = mul(uMatrix, float3(aPosition, 1.0)).xy;
+    vPosition = mul(viewMatrix * worldMatrix, float4(aPosition, 0.0, 1.0));
+}

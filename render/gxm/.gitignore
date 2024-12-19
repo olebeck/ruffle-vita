@@ -1,0 +1,4 @@
+bin/psp2cgc.exe
+bin/psp2cgnm.exe
+bin/psp2shaderperf.exe
+shaders/cache

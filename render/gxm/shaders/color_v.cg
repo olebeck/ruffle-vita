@@ -1,0 +1,16 @@
+void main(
+    float2 aPosition: POSITION,
+	unsigned char4 aColor: COLOR,
+
+    uniform float4x4 worldMatrix,
+    uniform float4x4 viewMatrix,
+    uniform float4 multColor,
+    uniform float4 addColor,
+
+    float4 out vPosition: POSITION,
+    float4 out vColor: COLOR0
+) {
+    vColor = clamp(aColor/255. * multColor + addColor, 0.0, 1.0);
+    vColor.rgb = vColor.rgb * clamp(vColor.a, 0.0, 1.0);
+    vPosition = mul(viewMatrix * worldMatrix, float4(aPosition, 0.0, 1.0));
+}

@@ -33,6 +33,11 @@ members = [
     "tests/socket-format",
     "tests/mocket",
     "tests/framework",
+
+    "render/gles2",
+    "render/gxm",
+    "vita",
+    "desktopgles"
 ]
 default-members = ["desktop"]
 resolver = "2"
@@ -100,7 +105,7 @@ opt-level = 0
 panic = "unwind"
 
 [profile.release]
-panic = "abort"
+panic = "unwind"
 
 [profile.dev.package.h263-rs]
 opt-level = 3
@@ -139,3 +144,8 @@ lto = "off"
 incremental = true
 # Right between the defaults of 16 and 256, for crate fragment caching.
 codegen-units = 64
+
+
+[patch.crates-io]
+hyper-util = { path = "./vita/hyper-util" }
+rlsf = { path = "./vita/rlsf/crates/rlsf" }
