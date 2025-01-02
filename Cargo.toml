@@ -34,10 +34,8 @@ members = [
     "tests/mocket",
     "tests/framework",
 
-    "render/gles2",
     "render/gxm",
     "vita",
-    "desktopgles"
 ]
 default-members = ["desktop"]
 resolver = "2"

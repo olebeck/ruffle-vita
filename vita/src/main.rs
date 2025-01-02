@@ -23,8 +23,7 @@ fn main() {
     let renderer = GxmRenderBackend::new(
         false,
         StageQuality::Best,
-    )
-        .expect("Couldn't create gxm rendering backend");
+    ).expect("Couldn't create gxm rendering backend");
 
     let width = renderer.width();
     let height = renderer.height();
