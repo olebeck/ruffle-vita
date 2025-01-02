@@ -18,4 +18,8 @@ swf = { path = "../../swf" }
 thiserror = { workspace = true }
 vitasdk-sys = { version = "0.3.3", features = ["SceGxm_stub", "SceDisplay_stub", "SceSysmem_stub", "SceSysmodule_stub"] }
 rlsf = "0.2.1"
+embedded-graphics = "0.8.1"
+bytesize = "1.3.0"
 
+[build]
+target = "armv7-sony-vita-newlibeabihf"

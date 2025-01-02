@@ -1,32 +1,25 @@
 use vitasdk_sys::*;
-use std::{alloc::Layout, collections::{hash_map::Entry, HashMap}, fmt::Debug, ptr::NonNull, rc::Rc, sync::Mutex};
+use std::{alloc::Layout, collections::{hash_map::Entry, HashMap}, fmt::Debug, mem::MaybeUninit, ptr::NonNull, rc::Rc, sync::{Mutex, OnceLock}};
 use rlsf::Tlsf;
+use embedded_graphics::{
+    mono_font::{ascii::FONT_10X20, MonoTextStyle}, pixelcolor::Rgb888, prelude::*, primitives::{Circle, PrimitiveStyle}, text::{Alignment, Text}
+};
 
 use crate::{sce_err, to_cstring, ALIGN};
 
-const HEAP_SIZE_LPDDR_R: usize = 64*1024*1024;
+const VDM_RING_BUFFER_SIZE: usize = 10 * 1024 * 1024;
+const VERTEX_RING_BUFFER_SIZE: usize = SCE_GXM_DEFAULT_VERTEX_RING_BUFFER_SIZE as usize;
+const FRAGMENT_RING_BUFFER_SIZE: usize = SCE_GXM_DEFAULT_FRAGMENT_RING_BUFFER_SIZE as usize;
+const FRAGMENT_USSE_RING_BUFFER_SIZE: usize = SCE_GXM_DEFAULT_FRAGMENT_USSE_RING_BUFFER_SIZE as usize;
+
+const HEAP_SIZE_LPDDR_R: usize = 64*1024*1024 + VDM_RING_BUFFER_SIZE + VERTEX_RING_BUFFER_SIZE + FRAGMENT_RING_BUFFER_SIZE + FRAGMENT_USSE_RING_BUFFER_SIZE;
 const HEAP_SIZE_LPDDR_RW: usize = 32*1024*1024;
 const HEAP_SIZE_CDRAM_RW: usize = 32*1024*1024;
 const HEAP_SIZE_VERTEX_USSE: usize = 1*1024*1024;
 const HEAP_SIZE_FRAGMENT_USSE: usize = 1*1024*1024;
 
-type Heap = Tlsf<'static, u32, u16, 20, 8>;
-
-pub static HEAP_LPDDR_R: Mutex<Heap> = Mutex::new(Tlsf::new());
-pub static HEAP_LPDDR_RW: Mutex<Heap> = Mutex::new(Tlsf::new());
-pub static HEAP_CDRAM_RW: Mutex<Heap> = Mutex::new(Tlsf::new());
-
-pub static HEAP_VERTEX_USSE: Mutex<Heap> = Mutex::new(Tlsf::new());
-pub static mut VERTEX_USSE_CPU: *mut c_void = std::ptr::null_mut();
-pub static mut VERTEX_USSE_OFFSET: u32 = 0;
-
-pub static HEAP_FRAGMENT_USSE: Mutex<Heap> = Mutex::new(Tlsf::new());
-pub static mut FRAGMENT_USSE_CPU: *mut c_void = std::ptr::null_mut();
-pub static mut FRAGMENT_USSE_OFFSET: u32 = 0;
-
-
 #[allow(non_camel_case_types)]
-#[derive(Debug)]
+#[derive(Debug,Clone,Copy)]
 pub enum HeapType {
     LPDDR_R,
 	LPDDR_RW,
@@ -35,130 +28,246 @@ pub enum HeapType {
 	FRAGMENT_USSE
 }
 
-#[macro_export]
+#[derive(Debug,Clone,Copy,PartialEq,Eq,Hash)]
+pub enum MemoryUsage {
+    Generic,
+    IndexBuffer,
+    VertexBuffer,
+    Texture,
+    VertexUsse,
+    FragmentUsse,
+    RingBuffers,
+    Display,
+}
+
+type Heap = Tlsf<'static, u32, u16, 20, 8>;
+
+
+#[derive(Debug)]
+pub struct Memory {
+    heap_lpddr_r: Heap,
+    heap_lpddr_rw: Heap,
+    heap_cdram_rw: Heap,
+    
+    heap_vertex_usse: Heap,
+    vertex_usse_cpu: usize,
+    vertex_usse_offset: usize,
+    
+    heap_fragment_usse: Heap,
+    fragment_usse_cpu: usize,
+    fragment_usse_offset: usize,
+
+    // allocations, used
+    allocation_sizes: HashMap<usize, (usize, MemoryUsage)>,
+    memory_usage: HashMap<MemoryUsage, (usize, usize)>
+}
+
 macro_rules! heap_create {
     ($mem:expr, $heap:expr, $size:expr, $attrib:expr) => {{
         sce_err!(sceGxmMapMemory, $mem.as_mut_ptr().cast(), $size as u32, $attrib);
-        let mut heap = $heap.lock().unwrap();
         unsafe {
-            heap.insert_free_block_ptr(NonNull::new(&mut $mem[..$size]).unwrap())
+            $heap.insert_free_block_ptr(NonNull::new(&mut $mem[..$size]).unwrap())
         };
         $mem = &mut $mem[$size..];
     }};
 }
 
-fn alloc_memblock(name: &str, memblock_type: u32, size: usize) -> *mut c_void {
-    let mut buf: *mut c_void = ::core::ptr::null_mut();
-    let block_uid = sce_err!(sceKernelAllocMemBlock,
-        to_cstring!(name).as_ptr(),
-        memblock_type,
-        size as u32,
-        ::core::ptr::null_mut()
-    );
-    sce_err!(sceKernelGetMemBlockBase, block_uid, &mut buf);
-    buf
+macro_rules! heap_usse_create {
+    ($mem:expr, $heap:expr, $size:expr, $cpu:expr, $offset:expr, $mapFunc:expr) => {{
+        sce_err!($mapFunc,
+            $cpu,
+            $size as u32,
+            &mut $offset
+        );
+        unsafe {
+            $heap.insert_free_block_ptr(
+                NonNull::new(&mut $mem[..$size]).unwrap()
+            );
+        }
+        $mem = &mut $mem[$size..];
+    }};
 }
 
-pub fn init_memory() {
-    const HEAP_SIZE_LPDDR: usize = HEAP_SIZE_LPDDR_R + HEAP_SIZE_LPDDR_RW + HEAP_SIZE_VERTEX_USSE + HEAP_SIZE_FRAGMENT_USSE;
-    let lpddr_base = alloc_memblock(
-        "Lpddr",
-        SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE,
-        HEAP_SIZE_LPDDR,
-    );
+impl Memory {
+    pub fn new() -> Memory {
+        const HEAP_SIZE_LPDDR: usize = HEAP_SIZE_LPDDR_R + HEAP_SIZE_LPDDR_RW + HEAP_SIZE_VERTEX_USSE + HEAP_SIZE_FRAGMENT_USSE;
 
-    let cdram_base = alloc_memblock(
-        "Cdram",
-        SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW,
-        HEAP_SIZE_CDRAM_RW,
-    );
+        let mut heap_lpddr_r = Tlsf::new();
+        let mut heap_lpddr_rw = Tlsf::new();
+        let mut heap_cdram_rw = Tlsf::new();
+        let mut heap_vertex_usse = Tlsf::new();
+        let mut heap_fragment_usse = Tlsf::new();
 
-    println!("lpddr_base: {:p} cdram_base: {:p}", lpddr_base, cdram_base);
+        let (lpddr_base, _lpddr_uid) = Memory::alloc_memblock(
+            "Lpddr",
+            SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE,
+            HEAP_SIZE_LPDDR,
+        );
 
-    let mut lpddr_mem = unsafe { std::slice::from_raw_parts_mut(lpddr_base as *mut u8, HEAP_SIZE_LPDDR as usize) };
-    let mut cdram_mem = unsafe { std::slice::from_raw_parts_mut(cdram_base as *mut u8, HEAP_SIZE_CDRAM_RW) };
+        let mut lpddr_mem = unsafe { std::slice::from_raw_parts_mut(
+            lpddr_base as *mut u8,
+            HEAP_SIZE_LPDDR as usize
+        ) };
+    
+        let (cdram_base, _cdram_uid) = Memory::alloc_memblock(
+            "Cdram",
+            SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW,
+            HEAP_SIZE_CDRAM_RW,
+        );
 
-    heap_create!(lpddr_mem, HEAP_LPDDR_R, HEAP_SIZE_LPDDR_R, SCE_GXM_MEMORY_ATTRIB_READ);
+        let mut cdram_mem = unsafe { std::slice::from_raw_parts_mut(
+            cdram_base as *mut u8,
+            HEAP_SIZE_CDRAM_RW
+        ) };
 
-    heap_create!(lpddr_mem, HEAP_LPDDR_RW, HEAP_SIZE_LPDDR_RW, SCE_GXM_MEMORY_ATTRIB_READ | SCE_GXM_MEMORY_ATTRIB_WRITE);
+        heap_create!(lpddr_mem, heap_lpddr_r, HEAP_SIZE_LPDDR_R, SCE_GXM_MEMORY_ATTRIB_READ);
+        heap_create!(lpddr_mem, heap_lpddr_rw, HEAP_SIZE_LPDDR_RW, SCE_GXM_MEMORY_ATTRIB_READ | SCE_GXM_MEMORY_ATTRIB_WRITE);
+        heap_create!(cdram_mem, heap_cdram_rw, HEAP_SIZE_CDRAM_RW, SCE_GXM_MEMORY_ATTRIB_READ | SCE_GXM_MEMORY_ATTRIB_WRITE);
 
-    heap_create!(cdram_mem, HEAP_CDRAM_RW, HEAP_SIZE_CDRAM_RW, SCE_GXM_MEMORY_ATTRIB_READ | SCE_GXM_MEMORY_ATTRIB_WRITE);
-
-    unsafe {
-        let vertex_usse_cpu = lpddr_mem.as_mut_ptr().cast();
         let mut vertex_usse_offset: u32 = 0;
-        sce_err!(sceGxmMapVertexUsseMemory,
-            vertex_usse_cpu,
-            HEAP_SIZE_FRAGMENT_USSE as u32,
-            &mut vertex_usse_offset
-        );
-        VERTEX_USSE_CPU = vertex_usse_cpu;
-        VERTEX_USSE_OFFSET = vertex_usse_offset;
-        let mut heap = HEAP_VERTEX_USSE.lock().unwrap();
-        heap.insert_free_block_ptr(
-            NonNull::new(&mut lpddr_mem[..HEAP_SIZE_VERTEX_USSE]).unwrap()
-        );
-    };
-    lpddr_mem = &mut lpddr_mem[HEAP_SIZE_VERTEX_USSE..];
-
-    unsafe {
-        let fragment_usse_cpu = lpddr_mem.as_mut_ptr().cast();
+        let vertex_usse_cpu = lpddr_mem.as_mut_ptr().cast();
+        heap_usse_create!(lpddr_mem, heap_vertex_usse, HEAP_SIZE_VERTEX_USSE, vertex_usse_cpu, vertex_usse_offset, sceGxmMapVertexUsseMemory);
+        
         let mut fragment_usse_offset: u32 = 0;
-        sce_err!(sceGxmMapFragmentUsseMemory,
-            fragment_usse_cpu,
-            HEAP_SIZE_FRAGMENT_USSE as u32,
-            &mut fragment_usse_offset
-        );
-        FRAGMENT_USSE_CPU = fragment_usse_cpu;
-        FRAGMENT_USSE_OFFSET = fragment_usse_offset;
-        let mut heap = HEAP_FRAGMENT_USSE.lock().unwrap();
-        heap.insert_free_block_ptr(
-            NonNull::new(&mut lpddr_mem[..HEAP_SIZE_FRAGMENT_USSE]).unwrap()
-        );
-    };
-    lpddr_mem = &mut lpddr_mem[HEAP_SIZE_FRAGMENT_USSE..];
+        let fragment_usse_cpu = lpddr_mem.as_mut_ptr().cast();
+        heap_usse_create!(lpddr_mem, heap_fragment_usse, HEAP_SIZE_FRAGMENT_USSE, fragment_usse_cpu, fragment_usse_offset, sceGxmMapFragmentUsseMemory);
 
-    let _ = lpddr_mem;
-    let _ = cdram_mem;
-}
+        let _ = lpddr_mem;
+        let _ = cdram_mem;
 
-pub struct Buffer<T> {
-    heap_type: HeapType,
-    align: usize,
-    pub ptr: *mut T,
-    pub len: usize
-}
+        let allocation_sizes = HashMap::new();
+        let mut memory_usage = HashMap::new();
+        for usage in [
+            MemoryUsage::Generic,
+            MemoryUsage::IndexBuffer,
+            MemoryUsage::VertexBuffer,
+            MemoryUsage::Texture,
+            MemoryUsage::VertexUsse,
+            MemoryUsage::FragmentUsse,
+            MemoryUsage::RingBuffers,
+            MemoryUsage::Display,
+        ] { memory_usage.insert(usage, (0, 0)); }
 
-impl<T> Buffer<T> {
-    pub fn new(heap_type: HeapType, len: usize, align: usize) -> Buffer<T> {
-        let mut heap = match heap_type {
-            HeapType::LPDDR_R => &HEAP_LPDDR_R,
-            HeapType::LPDDR_RW => &HEAP_LPDDR_RW,
-            HeapType::CDRAM_RW => &HEAP_CDRAM_RW,
-            HeapType::FRAGMENT_USSE => &HEAP_FRAGMENT_USSE,
-            HeapType::VERTEX_USSE => &HEAP_VERTEX_USSE,
-        }.lock().unwrap();
-
-        let layout = Layout::from_size_align(len*size_of::<T>(), align).unwrap();
-
-        println!("Buffer allocate size: {} align: {} heap: {:?}", layout.size(), layout.align(), heap_type);
-
-        let ptr = heap.allocate(layout).unwrap().as_ptr().cast();
-
-        Buffer::<T>{
-            heap_type,
-            align,
-            ptr,
-            len
+        Memory{
+            heap_lpddr_r,
+            heap_lpddr_rw,
+            heap_cdram_rw,
+            heap_vertex_usse,
+            vertex_usse_cpu: vertex_usse_cpu as usize,
+            vertex_usse_offset: vertex_usse_offset as usize,
+            heap_fragment_usse,
+            fragment_usse_cpu: fragment_usse_cpu as usize,
+            fragment_usse_offset: fragment_usse_offset as usize,
+            allocation_sizes,
+            memory_usage,
         }
     }
 
-    pub fn from_slice(heap_type: HeapType, src: &[T]) -> Buffer<T> {
-        let buf = Buffer::new(heap_type, src.len(), 4);
+    fn alloc_memblock(name: &str, memblock_type: u32, size: usize) -> (*mut c_void, SceUID) {
+        let mut buf: *mut c_void = ::core::ptr::null_mut();
+        let block_uid = sce_err!(sceKernelAllocMemBlock,
+            to_cstring!(name).as_ptr(),
+            memblock_type,
+            size as u32,
+            ::core::ptr::null_mut()
+        );
+        sce_err!(sceKernelGetMemBlockBase, block_uid, &mut buf);
+        (buf, block_uid)
+    }
+
+    pub fn allocate<T>(&mut self, heap_type: HeapType, usage: MemoryUsage, size: usize, align: usize) -> *mut T {
+        let heap = match heap_type {
+            HeapType::LPDDR_R => &mut self.heap_lpddr_r,
+            HeapType::LPDDR_RW => &mut self.heap_lpddr_rw,
+            HeapType::CDRAM_RW => &mut self.heap_cdram_rw,
+            HeapType::FRAGMENT_USSE => &mut self.heap_fragment_usse,
+            HeapType::VERTEX_USSE => &mut self.heap_vertex_usse,
+        };
+        let layout = Layout::from_size_align(size, align).unwrap();
+        let ptr = match heap.allocate(layout) {
+            Some(v) => v.as_ptr(),
+            None => panic!("allocate failed {heap_type:?}")
+        };
+
+        self.allocation_sizes.insert(ptr as usize, (size, usage.clone()));
+
+        let (allocations, used) = match self.memory_usage.get(&usage) {
+            None => panic!("unhandled memory type {usage:?}"),
+            Some(v) => *v
+        };
+        self.memory_usage.insert(usage, (allocations + 1, used + size));
+
+        println!("allocate size: {} align: {} heap: {:?}", layout.size(), layout.align(), heap_type);
+        ptr as *mut T
+    }
+
+    pub fn free<T>(&mut self, heap_type: HeapType, ptr: *mut T, align: usize) {
+        let heap = match heap_type {
+            HeapType::LPDDR_R => &mut self.heap_lpddr_r,
+            HeapType::LPDDR_RW => &mut self.heap_lpddr_rw,
+            HeapType::CDRAM_RW => &mut self.heap_cdram_rw,
+            HeapType::FRAGMENT_USSE => &mut self.heap_fragment_usse,
+            HeapType::VERTEX_USSE => &mut self.heap_vertex_usse,
+        };
+
+        let (size, usage) = *self.allocation_sizes.get(&(ptr as usize)).unwrap();
+        let (allocations, used) = *self.memory_usage.get(&usage).expect("unhandled memory type");
+        self.memory_usage.insert(usage, (allocations - 1, used - size));
+
+        unsafe {
+            heap.deallocate(NonNull::new_unchecked(ptr as *mut u8), align);
+        }
+    }
+
+    fn draw_debug_overlay(&mut self, display: &mut DisplayData) {
+        let style = MonoTextStyle::new(&FONT_10X20, Rgb888::new(0x00, 0xff, 0x00));
+        let mut lines: String = "".to_string();
+        for (usage, (allocations, used)) in self.memory_usage.iter() {
+            let size = bytesize::ByteSize(*used as u64);
+            lines.push_str(&format!("{usage:?} {allocations}, {size}\n"));
+        }
+
+        Text::with_alignment(
+            &lines,
+            Point::new(20, 20),
+            style,
+            Alignment::Left,
+        ).draw(display).unwrap();
+    }
+}
+
+fn memory() -> &'static Mutex<Memory> {
+    static MEMORY: OnceLock<Mutex<Memory>> = OnceLock::new();
+    MEMORY.get_or_init(|| Mutex::new(Memory::new()))
+}
+
+#[derive(Debug,Clone)]
+pub struct Buffer<T> {
+    heap_type: HeapType,
+    pub ptr: *mut T,
+    pub len: usize,
+    align: usize,
+}
+
+impl<T> Buffer<T> {
+    pub fn new(heap_type: HeapType, usage: MemoryUsage, len: usize, align: usize) -> Buffer<T> {
+        let mut memory = memory().lock().unwrap();
+        let ptr = memory.allocate(heap_type.clone(), usage, len * std::mem::size_of::<T>(), align);
+        Buffer {
+            heap_type,
+            ptr,
+            len,
+            align
+        }
+    }
+
+    pub fn from_slice(heap_type: HeapType, usage: MemoryUsage, src: &[T]) -> Buffer<T> {
+        let buf = Buffer::new(heap_type, usage, src.len(), 4);
         unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), buf.ptr, buf.len) };
         buf
     }
 
+    #[allow(unused)]
     pub fn as_slice(&self) -> &[T] {
         unsafe { std::slice::from_raw_parts(self.ptr, self.len)  }
     }
@@ -174,31 +283,9 @@ impl<T> Buffer<T> {
 
 impl<T> Drop for Buffer<T> {
     fn drop(&mut self) {
-        let mut heap = match self.heap_type {
-            HeapType::LPDDR_R => &HEAP_LPDDR_R,
-            HeapType::LPDDR_RW => &HEAP_LPDDR_RW,
-            HeapType::CDRAM_RW => &HEAP_CDRAM_RW,
-            HeapType::FRAGMENT_USSE => &HEAP_FRAGMENT_USSE,
-            HeapType::VERTEX_USSE => &HEAP_VERTEX_USSE,
-        }.lock().unwrap();
-
-        println!("Buffer free {:p} {:?}", self.ptr, self.heap_type);
-        match NonNull::new(self.ptr as *mut u8) {
-            Some(ptr) => unsafe {
-                heap.deallocate(ptr, self.align)
-            }
-            None => ()
-        }
-    }
-}
-
-impl<T> Debug for Buffer<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Buffer").
-            field("heap_type", &self.heap_type).
-            field("align", &self.align).
-            field("ptr", &self.ptr).
-            finish()
+        if self.ptr.is_null() { return; }
+        let mut memory = memory().lock().unwrap();
+        memory.free(self.heap_type, self.ptr, self.align);
     }
 }
 
@@ -207,27 +294,59 @@ struct DisplayData {
     width: u32,
     height: u32,
     stride: u32,
-    flip_mode: u32
+    flip_mode: u32,
+}
+
+impl DrawTarget for DisplayData {
+    type Color = Rgb888;
+    type Error = u32;
+
+    fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
+    where
+        I: IntoIterator<Item = Pixel<Self::Color>> {
+        for Pixel(coord, color) in pixels.into_iter() {
+            let color = color.to_le_bytes();
+            unsafe {
+                let pixel_ptr = self.address.add(((coord.y * self.stride as i32 + coord.x) * 4) as usize) as *mut u8;
+                let pixel = std::ptr::slice_from_raw_parts_mut(pixel_ptr, 4);
+                (*pixel)[0] = color[2];
+                (*pixel)[1] = color[1];
+                (*pixel)[2] = color[0];
+                (*pixel)[3] = 0xff;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl OriginDimensions for DisplayData {
+    fn size(&self) -> Size {
+        Size::new(self.width, self.height)
+    }
 }
 
 unsafe extern "C" fn display_callback(callback_data: *const c_void) {
     const SCE_DISPLAY_PIXELFORMAT_A8B8G8R8: u32 = 0;
 
-    let display_data = &*(callback_data as *const DisplayData);
-    let framebuf = SceDisplayFrameBuf{
+    let mut display_data = &mut *(callback_data as *mut DisplayData);
+    
+    let mut memory = memory().lock().unwrap();
+
+    memory.draw_debug_overlay(&mut display_data);
+
+    sceDisplaySetFrameBuf(&SceDisplayFrameBuf{
         size: std::mem::size_of::<SceDisplayFrameBuf>() as u32,
         base: display_data.address,
         pitch: display_data.stride,
         pixelformat: SCE_DISPLAY_PIXELFORMAT_A8B8G8R8,
         width: display_data.width,
         height: display_data.height,
-    };
-    sceDisplaySetFrameBuf(&framebuf, display_data.flip_mode);
+    }, display_data.flip_mode);
     sceDisplayWaitSetFrameBuf();
 }
 
 
-pub fn init_gxm() {
+fn init_gxm() {
     let initialize_params = SceGxmInitializeParams{
         flags: 0,
         displayQueueMaxPendingCount: 2,
@@ -249,8 +368,12 @@ pub struct Context {
 
 impl Drop for Context {
     fn drop(&mut self) {
-        println!("Dropping Context??");
         sce_err!(sceGxmDestroyContext, self.context);
+        let _ = self.host_mem;
+        let _ = self.vdm_mem;
+        let _ = self.vertex_mem;
+        let _ = self.fragment_mem;
+        let _ = self.fragment_usse_mem;
     }
 }
 
@@ -271,33 +394,58 @@ fn sce_kernel_load_start_module(name: &str) -> Result<(), &'static str> {
     return Ok(());
 }
 
+fn init_razor_capture() {
+    //sce_err!(sceSysmoduleLoadModule, SCE_SYSMODULE_RAZOR_CAPTURE);
+    match sce_kernel_load_start_module("app0:librazorcapture_es4.suprx") {
+        Ok(_) => {
+            println!("loaded razor, will capture at frame 20");
+            unsafe {
+                sceRazorGpuCaptureSetTrigger(20, to_cstring!("ux0:data/capture.sgx").as_ptr());
+                sceRazorGpuCaptureEnableSalvage(to_cstring!("ux0:data/gpu_crash.sgx").as_ptr());
+            }
+        }
+        Err(e) => {
+            println!("not enabling frame capture, razor: {}", e)
+        }            
+    }
+}
+
 impl Context {
     pub fn new() -> Context {
-        //sce_err!(sceSysmoduleLoadModule, SCE_SYSMODULE_RAZOR_CAPTURE);
-        match sce_kernel_load_start_module("app0:librazorcapture_es4.suprx") {
-            Ok(_) => {
-                println!("loaded razor, will capture at frame 20");
-                unsafe {
-                    sceRazorGpuCaptureSetTrigger(20, to_cstring!("ux0:data/capture.sgx").as_ptr());
-                    //sceRazorGpuCaptureEnableSalvage(to_cstring!("ux0:data/gpu_crash.sgx").as_ptr());
-                }
-            }
-            Err(e) => {
-                println!("not enabling frame capture, razor: {}", e)
-            }            
-        }
-
+        init_razor_capture();
         init_gxm();
-        init_memory();
 
         let mut host_mem: Vec<u8> = Vec::new();
         host_mem.resize(2 * 1024, 0);
 
-        let vdm_mem: Buffer<u8> = Buffer::new(HeapType::LPDDR_R, SCE_GXM_DEFAULT_VDM_RING_BUFFER_SIZE as usize, 4);
-        let vertex_mem: Buffer<u8> = Buffer::new(HeapType::LPDDR_R, SCE_GXM_DEFAULT_VERTEX_RING_BUFFER_SIZE as usize, 4);
-        let fragment_mem: Buffer<u8> = Buffer::new(HeapType::LPDDR_R, SCE_GXM_DEFAULT_FRAGMENT_RING_BUFFER_SIZE as usize, 4);
-        let fragment_usse_mem: Buffer<u8> = Buffer::new(HeapType::FRAGMENT_USSE, SCE_GXM_DEFAULT_FRAGMENT_USSE_RING_BUFFER_SIZE as usize, 4);
-        let fragment_usse_offset = unsafe { fragment_usse_mem.ptr.sub(FRAGMENT_USSE_CPU as usize).add(FRAGMENT_USSE_OFFSET as usize) as u32 };
+        let vdm_mem: Buffer<u8> = Buffer::new(
+            HeapType::LPDDR_R,
+            MemoryUsage::RingBuffers,
+            VDM_RING_BUFFER_SIZE as usize,
+            4
+        );
+        let vertex_mem: Buffer<u8> = Buffer::new(
+            HeapType::LPDDR_R,
+            MemoryUsage::RingBuffers,
+            VERTEX_RING_BUFFER_SIZE as usize,
+            4
+        );
+        let fragment_mem: Buffer<u8> = Buffer::new(
+            HeapType::LPDDR_R,
+            MemoryUsage::RingBuffers,
+            FRAGMENT_RING_BUFFER_SIZE as usize,
+            4
+        );
+        let fragment_usse_mem: Buffer<u8> = Buffer::new(
+            HeapType::FRAGMENT_USSE,
+            MemoryUsage::RingBuffers,
+            FRAGMENT_USSE_RING_BUFFER_SIZE as usize,
+            4
+        );
+        let fragment_usse_offset = unsafe {
+            let memory = memory().lock().unwrap();
+            fragment_usse_mem.ptr.sub(memory.fragment_usse_cpu as usize).add(memory.fragment_usse_offset as usize) as u32
+        };
 
         let context_params = SceGxmContextParams{
             hostMem: host_mem.as_mut_ptr().cast(),
@@ -353,13 +501,29 @@ impl Context {
 
     pub fn set_viewport(&mut self, x: i32, y: i32, width: i32, height: i32) {
         unsafe {
-                sceGxmSetViewport(
+            sceGxmSetViewport(
                 self.context,
                 x as f32, width as f32,
                 y as f32, height as f32,
                 0., 1.
             );
         }
+    }
+    
+    pub fn set_depth_write_enable(&mut self, enable: bool) {
+        unsafe {
+            sceGxmSetFrontDepthWriteEnable(self.context, match enable {
+                true => SCE_GXM_DEPTH_WRITE_ENABLED,
+                false => SCE_GXM_DEPTH_WRITE_DISABLED,
+            });
+        }
+        if !enable {
+            self.set_front_depth_func(SCE_GXM_DEPTH_FUNC_ALWAYS);
+        }
+    }
+
+    pub fn set_front_depth_func(&mut self, depth_func: SceGxmDepthFunc) {
+        unsafe { sceGxmSetFrontDepthFunc(self.context, depth_func); }
     }
 
     pub fn set_front_stencil_func(
@@ -417,18 +581,34 @@ impl Context {
             if index_count == 0 { index_data.len } else { index_count } as u32
         );
     }
+
+    pub fn push_marker(&self, name: &'static str) {
+        sce_err!(sceGxmPushUserMarker, self.context, to_cstring!(name).as_ptr());
+    }
+
+    pub fn pop_marker(&self) {
+        sce_err!(sceGxmPopUserMarker, self.context);
+    }
 }
 
 pub struct Texture {
     texture: SceGxmTexture,
     pub texture_data: Buffer<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
 }
 
 impl Texture {
     pub fn new(width: u32, height: u32, format: SceGxmTextureFormat, data: &[u8]) -> Texture {
-        let texture_data: Buffer<u8> = Buffer::new(HeapType::LPDDR_R, data.len(), SCE_GXM_TEXTURE_ALIGNMENT as usize);
+        let texture_data: Buffer<u8> = Buffer::new(
+            HeapType::LPDDR_R,
+            MemoryUsage::Texture,
+            data.len(),
+            SCE_GXM_TEXTURE_ALIGNMENT as usize
+        );
         unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), texture_data.ptr, data.len()) };
-        
+
         let mut texture: SceGxmTexture = unsafe { std::mem::zeroed() };
         sce_err!(sceGxmTextureInitLinear,
             &mut texture,
@@ -438,10 +618,15 @@ impl Texture {
             height,
             0
         );
+
+        let stride = unsafe { sceGxmTextureGetStride(&texture) };
         
         Texture{
             texture,
-            texture_data
+            texture_data,
+            width,
+            height,
+            stride
         }
     }
 
@@ -490,13 +675,16 @@ pub struct Display {
 
 impl Display {
     pub fn new(msaa_mode: u32, depth_format: SceGxmDepthStencilFormat) -> Display {
-        let mut display_buffer_data: [Buffer<u32>; DISPLAY_BUFFER_COUNT] = unsafe { std::mem::zeroed() };
+        let mut display_buffer_data: [MaybeUninit<Buffer<u32>>; DISPLAY_BUFFER_COUNT] = MaybeUninit::uninit_array();
         let mut display_surface: [SceGxmColorSurface; DISPLAY_BUFFER_COUNT] = unsafe { std::mem::zeroed() };
         let mut display_buffer_sync: [*mut SceGxmSyncObject; DISPLAY_BUFFER_COUNT] = unsafe { std::mem::zeroed() };
         for i in 0..DISPLAY_BUFFER_COUNT {
-            let display_buffer: Buffer<u32> = Buffer::new(HeapType::CDRAM_RW, (DISPLAY_STRIDE_IN_PIXELS*DISPLAY_HEIGHT) as usize, 256);
-            display_buffer_data[i] = display_buffer;
-
+            let display_buffer: Buffer<u32> = Buffer::new(
+                HeapType::CDRAM_RW,
+                MemoryUsage::Display,
+                (DISPLAY_STRIDE_IN_PIXELS*DISPLAY_HEIGHT) as usize,
+                256
+            );
             sce_err!(sceGxmColorSurfaceInit,
                 &mut display_surface[i],
                 SCE_GXM_COLOR_FORMAT_A8B8G8R8,
@@ -506,11 +694,13 @@ impl Display {
                 DISPLAY_WIDTH,
                 DISPLAY_HEIGHT,
                 DISPLAY_STRIDE_IN_PIXELS,
-                display_buffer_data[i].ptr.cast()
+                display_buffer.ptr.cast()
             );
-            
+            display_buffer_data[i] = MaybeUninit::new(display_buffer);
             sce_err!(sceGxmSyncObjectCreate, &mut display_buffer_sync[i]);
         }
+
+        let display_buffer_data: [Buffer<u32>; DISPLAY_BUFFER_COUNT] = unsafe { MaybeUninit::array_assume_init(display_buffer_data) };
 
         // compute depth buffer dimensions
         const ALIGNED_WIDTH: u32 = ALIGN!(DISPLAY_WIDTH, SCE_GXM_TILE_SIZEX);
@@ -541,6 +731,7 @@ impl Display {
         let main_depth_buffer_data: Option<Buffer<u8>> = if depth_bytes_per_sample == 0 { None } else {
             Some(Buffer::new(
                 HeapType::LPDDR_RW,
+                MemoryUsage::Display,
                 (depth_bytes_per_sample*sample_count) as usize,
                 SCE_GXM_DEPTHSTENCIL_SURFACE_ALIGNMENT as usize
             ))
@@ -549,6 +740,7 @@ impl Display {
         let main_stencil_buffer_data: Option<Buffer<u8>> = if stencil_bytes_per_sample == 0 { None } else {
             Some(Buffer::new(
                 HeapType::LPDDR_RW,
+                MemoryUsage::Display,
                 (stencil_bytes_per_sample*sample_count) as usize,
                 SCE_GXM_DEPTHSTENCIL_SURFACE_ALIGNMENT as usize
             ))
@@ -558,7 +750,7 @@ impl Display {
         sce_err!(sceGxmDepthStencilSurfaceInit,
             &mut main_depth_surface,
             depth_format,
-            SCE_GXM_DEPTH_STENCIL_SURFACE_TILED,
+            SCE_GXM_DEPTH_STENCIL_SURFACE_LINEAR,
             depth_stride_in_samples,
             match main_depth_buffer_data {
                 Some(ref data) => data.ptr.cast(),
@@ -571,33 +763,30 @@ impl Display {
         );
 
         let display_front_buffer_index = DISPLAY_BUFFER_COUNT-1;
-
-        let framebuf = SceDisplayFrameBuf{
-            size: std::mem::size_of::<SceDisplayFrameBuf>() as u32,
-            base: display_buffer_data[display_front_buffer_index].ptr.cast(),
-            pitch: DISPLAY_STRIDE_IN_PIXELS,
-            pixelformat: SCE_DISPLAY_PIXELFORMAT_A8B8G8R8,
-            width: DISPLAY_WIDTH,
-            height: DISPLAY_HEIGHT,
-        };
         sce_err!(sceDisplaySetFrameBuf,
-            &framebuf,
+            &SceDisplayFrameBuf{
+                size: std::mem::size_of::<SceDisplayFrameBuf>() as u32,
+                base: display_buffer_data[display_front_buffer_index].ptr.cast(),
+                pitch: DISPLAY_STRIDE_IN_PIXELS,
+                pixelformat: SCE_DISPLAY_PIXELFORMAT_A8B8G8R8,
+                width: DISPLAY_WIDTH,
+                height: DISPLAY_HEIGHT,
+            },
             SCE_DISPLAY_SETBUF_NEXTFRAME
         );
         sce_err!(sceDisplayWaitSetFrameBuf,);
 
-        let render_target_params = SceGxmRenderTargetParams{
-            flags: 0,
-            width: DISPLAY_WIDTH as u16,
-            height: DISPLAY_HEIGHT as u16,
-            scenesPerFrame: 8,
-            multisampleMode: msaa_mode as u16,
-            multisampleLocations: 0,
-            driverMemBlock: -1,
-        };
         let mut main_render_target: *mut SceGxmRenderTarget = std::ptr::null_mut();
         sce_err!(sceGxmCreateRenderTarget,
-            &render_target_params,
+            &SceGxmRenderTargetParams{
+                flags: 0,
+                width: DISPLAY_WIDTH as u16,
+                height: DISPLAY_HEIGHT as u16,
+                scenesPerFrame: 8,
+                multisampleMode: msaa_mode as u16,
+                multisampleLocations: 0,
+                driverMemBlock: -1,
+            },
             &mut main_render_target
         );
 
@@ -619,6 +808,8 @@ impl Display {
     }
 
     pub fn swap_buffers(&mut self) {
+        let _ = self.main_depth_buffer_data;
+        let _ = self.main_stencil_buffer_data;
         sce_err!(sceGxmPadHeartbeat,
             &self.display_surface[self.display_back_buffer_index],
             self.display_buffer_sync[self.display_back_buffer_index]
@@ -658,45 +849,42 @@ impl ShaderPatcher {
     unsafe extern "C" fn patcher_host_free(_user_data: *mut c_void, mem: *mut c_void) {
         let real_mem = mem.sub(4);
         let size = *(real_mem as *mut u32);
-        println!("dealloc {}", size);
         let layout = std::alloc::Layout::from_size_align(size as usize + 4, 4).unwrap();
         std::alloc::dealloc(real_mem.cast(), layout);
     }
     
     unsafe extern "C" fn patcher_buffer_alloc(_user_data: *mut c_void, size: u32) -> *mut c_void {
-        let mut heap = HEAP_LPDDR_RW.lock().unwrap();
-        return heap.allocate(Layout::from_size_align(size as usize, 4).unwrap()).unwrap().as_ptr().cast();
+        let mut memory = memory().lock().unwrap();
+        memory.allocate(HeapType::LPDDR_RW, MemoryUsage::Generic, size as usize, 4)
     }
     
     unsafe extern "C" fn patcher_buffer_free(_user_data: *mut c_void, mem: *mut c_void) {
-        let mut heap = HEAP_LPDDR_RW.lock().unwrap();
-        heap.deallocate(NonNull::new(mem.cast()).unwrap(), 4);
+        let mut memory = memory().lock().unwrap();
+        memory.free(HeapType::LPDDR_RW, mem, 4)
     }
     
     unsafe extern "C" fn patcher_vertex_usse_alloc(_user_data: *mut c_void, size: u32, usse_offset: *mut c_uint) -> *mut c_void {
-        let mut heap = HEAP_VERTEX_USSE.lock().unwrap();
-        let layout = Layout::from_size_align(size as usize, 16).unwrap();
-        let mem: *mut c_void = heap.allocate(layout).unwrap().as_ptr().cast();
-        *usse_offset = mem.sub(VERTEX_USSE_CPU as usize).add(VERTEX_USSE_OFFSET as usize) as u32;
-        return mem
+        let mut memory = memory().lock().unwrap();
+        let mem: *mut u8 = memory.allocate(HeapType::VERTEX_USSE, MemoryUsage::VertexUsse, size as usize, 16);
+        *usse_offset = mem.sub(memory.vertex_usse_cpu as usize).add(memory.vertex_usse_offset as usize) as u32;
+        return mem as *mut c_void
     }
     
     unsafe extern "C" fn patcher_vertex_usse_free(_user_data: *mut c_void, mem: *mut c_void) {
-        let mut heap = HEAP_VERTEX_USSE.lock().unwrap();
-        heap.deallocate(NonNull::new(mem.cast()).unwrap(), 16);
+        let mut memory = memory().lock().unwrap();
+        memory.free(HeapType::VERTEX_USSE, mem, 16);
     }
 
     unsafe extern "C" fn patcher_fragment_usse_alloc(_user_data: *mut c_void, size: u32, usse_offset: *mut c_uint) -> *mut c_void {
-        let mut heap = HEAP_FRAGMENT_USSE.lock().unwrap();
-        let layout = Layout::from_size_align(size as usize, 16).unwrap();
-        let mem: *mut c_void = heap.allocate(layout).unwrap().as_ptr().cast();
-        *usse_offset = mem.sub(FRAGMENT_USSE_CPU as usize).add(FRAGMENT_USSE_OFFSET as usize) as u32;
-        return mem
+        let mut memory = memory().lock().unwrap();
+        let mem: *mut u8 = memory.allocate(HeapType::FRAGMENT_USSE, MemoryUsage::FragmentUsse, size as usize, 16);
+        *usse_offset = mem.sub(memory.fragment_usse_cpu as usize).add(memory.fragment_usse_offset as usize) as u32;
+        return mem as *mut c_void
     }
     
     unsafe extern "C" fn patcher_fragment_usse_free(_user_data: *mut c_void, mem: *mut c_void) {
-        let mut heap = HEAP_FRAGMENT_USSE.lock().unwrap();
-        heap.deallocate(NonNull::new(mem.cast()).unwrap(), 16);
+        let mut memory = memory().lock().unwrap();
+        memory.free(HeapType::FRAGMENT_USSE, mem, 16);
     }
 
     pub fn new() -> ShaderPatcher {
@@ -893,8 +1081,7 @@ impl FragmentShader {
                 SCE_GXM_PARAMETER_CATEGORY_UNIFORM => {
                     uniforms.push(param);
                 }
-                SCE_GXM_PARAMETER_CATEGORY_SAMPLER => {
-                }
+                SCE_GXM_PARAMETER_CATEGORY_SAMPLER => {}
                 _ => {
                     panic!("Unexpected parameter category {}", param.category);
                 }
@@ -929,6 +1116,7 @@ impl FragmentShaderProgram {
         blend_info: SceGxmBlendInfo,
         shader_patcher: Rc<ShaderPatcher>,
         vertex_binary: &[u8],
+        msaa_mode: SceGxmMultisampleMode,
     ) -> FragmentShaderProgram {
         let shader_patcher_ptr: *mut SceGxmShaderPatcher = shader_patcher.as_ref().shader_patcher;
 
@@ -938,7 +1126,7 @@ impl FragmentShaderProgram {
             shader_patcher_ptr,
             shader.registered,
             SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4,
-            SCE_GXM_MULTISAMPLE_NONE,
+            msaa_mode,
             &blend_info,
             vertex_binary.as_ptr().cast(),
             &mut fragment_program
@@ -982,11 +1170,11 @@ impl ShaderProgram {
             name,
             vertex_shader,
             fragment_shader,
-            uniform_map: uniform_map,
+            uniform_map,
         }
     }
     
-    pub fn set_uniform_v(
+    pub fn set_uniform(
         &self,
         id: usize,
         values: &[f32],
@@ -1008,7 +1196,7 @@ impl ShaderProgram {
                 );
             },
             None => {
-                panic!("Uniform ID '{}' is not registered", id);
+                //panic!("Uniform ID '{}' is not registered", id);
             }
         }
     }
@@ -1035,15 +1223,7 @@ impl ShaderProgram {
         }
     }
 
-    pub fn set_uniform(
-        &self,
-        id: usize,
-        values: &[f32],
-        uniform_buffers: UniformBuffers,
-    ) {
-        self.set_uniform_v(id, values, uniform_buffers);
-    }
-
+    #[allow(unused)]
     pub fn dump_uniform_data(&self, uniform_buffers: UniformBuffers) {
         let vertex_buffer = uniform_buffers.0;
         let fragment_buffer = uniform_buffers.1;
@@ -1127,12 +1307,14 @@ pub struct ShaderRegistry {
     shader_programs: HashMap<(usize, BlendState), Rc<ShaderProgram>>,
     uniform_names: &'static [&'static str],
     shader_patcher: Rc<ShaderPatcher>,
+    msaa_mode: SceGxmMultisampleMode,
 }
 
 impl ShaderRegistry {
     pub fn new(
         uniform_names: &'static [&'static str],
         shader_patcher: ShaderPatcher,
+        msaa_mode: SceGxmMultisampleMode,
     ) -> Self {
         Self {
             vertex_programs: Vec::new(),
@@ -1141,21 +1323,21 @@ impl ShaderRegistry {
             shader_programs: HashMap::new(),
             uniform_names,
             shader_patcher: Rc::new(shader_patcher),
+            msaa_mode,
         }
     }
 
-    pub fn register_vertex_shader(
+    pub fn register_vertex_shader<T: Sized>(
         &mut self,
         name: &'static str,
         vertex_shader_binary: &'static [u8],
-        vertex_stride: u16,
         attributes: &[(SceGxmVertexAttribute, &'static str)]
     ) -> Result<usize, String> {
         let vertex_program = VertexShaderProgram::new(
             name,
             Rc::clone(&self.shader_patcher),
             vertex_shader_binary,
-            vertex_stride,
+            std::mem::size_of::<T>() as u16,
             attributes
         );
         self.vertex_programs.push(Rc::new(vertex_program));
@@ -1238,6 +1420,7 @@ impl ShaderRegistry {
                     Self::blend_state_as_gxm(blend_state),
                     Rc::clone(&self.shader_patcher),
                     vertex_program.binary,
+                    self.msaa_mode,
                 );
         
                 let new_program = Rc::new(ShaderProgram::new(

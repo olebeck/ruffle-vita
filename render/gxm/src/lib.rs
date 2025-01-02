@@ -1,7 +1,7 @@
 #![deny(clippy::unwrap_used)]
-// Remove this when we start using `Rc` when compiling for wasm
-#![allow(clippy::arc_with_non_send_sync)]
 #![feature(iter_collect_into)]
+#![feature(maybe_uninit_uninit_array)]
+#![feature(maybe_uninit_array_assume_init)]
 
 use bytemuck::{Pod, Zeroable};
 use ruffle_render::backend::{
@@ -18,10 +18,12 @@ use ruffle_render::matrix::Matrix;
 use ruffle_render::quality::StageQuality;
 use ruffle_render::shape_utils::DistilledShape;
 use ruffle_render::tessellator::{
-    Gradient as TessGradient, ShapeTessellator, Vertex as TessVertex,
+    Gradient as TessGradient, ShapeTessellator, Vertex as TessVertex, DrawType as TessDrawType,
 };
 use ruffle_render::transform::Transform;
 use std::borrow::Cow;
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use swf::{BlendMode, Color, Twips};
@@ -34,41 +36,8 @@ mod macros;
 
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("Couldn't create GL context")]
-    CantCreateGLContext,
-
-    #[error("Couldn't create frame buffer")]
-    UnableToCreateFrameBuffer,
-
-    #[error("Couldn't create program")]
-    UnableToCreateProgram,
-
-    #[error("Couldn't create texture")]
-    UnableToCreateTexture,
-
-    #[error("Couldn't compile shader")]
-    UnableToCreateShader,
-
-    #[error("Couldn't create render buffer")]
-    UnableToCreateRenderBuffer,
-
-    #[error("Couldn't create vertex array object")]
-    UnableToCreateVAO,
-
-    #[error("Couldn't create buffer")]
-    UnableToCreateBuffer,
-
-    #[error("OES_element_index_uint extension not available")]
-    OESExtensionNotFound,
-
-    #[error("VAO extension not found")]
-    VAOExtensionNotFound,
-
-    #[error("Couldn't link shader program: {0}")]
-    LinkingShaderProgram(String),
-
-    #[error("GL Error in {0}: {1}")]
-    GLError(&'static str, u32),
+    #[error("GXM Error in {0}: {1}")]
+    GXMError(&'static str, u32),
 }
 
 const COLOR_VERTEX_GXP: &[u8] = include_bytes_align_as!(u32, "../shaders/compiled/color_v.gxp");
@@ -91,10 +60,24 @@ enum MaskState {
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 struct Vertex {
     position: [f32; 2],
-    color: u32,
 }
 
 impl From<TessVertex> for Vertex {
+    fn from(vertex: TessVertex) -> Self {
+        Self {
+            position: [vertex.x, vertex.y],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+struct VertexColor {
+    position: [f32; 2],
+    color: u32,
+}
+
+impl From<TessVertex> for VertexColor {
     fn from(vertex: TessVertex) -> Self {
         Self {
             position: [vertex.x, vertex.y],
@@ -108,6 +91,26 @@ impl From<TessVertex> for Vertex {
     }
 }
 
+fn simd_matmul(a: [[f32; 4]; 4], b: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
+    let mut result = [[0.0; 4]; 4];
+
+    // Loop over rows of A
+    for i in 0..4 {
+        // Loop over columns of B
+        for j in 0..4 {
+            let mut sum = 0.0;
+
+            // Loop over the elements in the row of A and column of B
+            for k in 0..4 {
+                sum += a[i][k] * b[k][j];
+            }
+
+            result[i][j] = sum;
+        }
+    }
+
+    result
+}
 
 pub struct GxmRenderBackend {
     // gxm context
@@ -126,6 +129,7 @@ pub struct GxmRenderBackend {
     shape_tessellator: ShapeTessellator,
 
     quad_verticies: gxm::Buffer<Vertex>,
+    quad_verticies_color: gxm::Buffer<VertexColor>,
     quad_indicies: gxm::Buffer<u32>,
 
     mask_state: MaskState,
@@ -140,12 +144,16 @@ pub struct GxmRenderBackend {
 
     renderbuffer_width: i32,
     renderbuffer_height: i32,
-    view_matrix: [[f32; 4]; 4],
+    projection_matrix: [[f32; 4]; 4],
 
     // This is currently unused - we just hold on to it
     // to expose via `get_viewport_dimensions`
     viewport_scale_factor: f64,
+
+    gradient_textures: HashMap<GradientKey, Rc<gxm::Texture>>
 }
+
+type GradientKey = (Vec<swf::GradientRecord>, swf::GradientInterpolation);
 
 #[derive(Debug)]
 struct RegistryData {
@@ -181,87 +189,89 @@ impl GxmRenderBackend {
         // Determine MSAA sample count.
         let msaa_sample_count = quality.sample_count().min(4);
 
-        let depth_format: SceGxmDepthStencilFormat = SCE_GXM_DEPTH_STENCIL_FORMAT_DF32_S8;
-        let msaa_mode: SceGxmMultisampleMode = SCE_GXM_MULTISAMPLE_NONE;
+        let depth_format: SceGxmDepthStencilFormat = SCE_GXM_DEPTH_STENCIL_FORMAT_S8;
+        let msaa_mode: SceGxmMultisampleMode = match msaa_sample_count {
+            1 => SCE_GXM_MULTISAMPLE_NONE,
+            2 => SCE_GXM_MULTISAMPLE_2X,
+            4 => SCE_GXM_MULTISAMPLE_4X,
+            _ => SCE_GXM_MULTISAMPLE_NONE,
+        };
 
-        let context = gxm::Context::new();
+        let mut context = gxm::Context::new();
         let display = gxm::Display::new(msaa_mode, depth_format);
         let shader_patcher = gxm::ShaderPatcher::new();
-        let mut shader_registry = gxm::ShaderRegistry::new(&UNIFORM_NAMES, shader_patcher);
+        let mut shader_registry = gxm::ShaderRegistry::new(&UNIFORM_NAMES, shader_patcher, msaa_mode);
 
-        let vertex_stride = std::mem::size_of::<Vertex>() as u16;
-        let vertex_attributes: [(SceGxmVertexAttribute, &'static str); 2] = [
-            (SceGxmVertexAttribute{
-                streamIndex: 0,
-                offset: 0,
-                format: SCE_GXM_ATTRIBUTE_FORMAT_F32 as u8,
-                componentCount: 2,
-                regIndex: 0,
-            }, "aPosition"),
-            (SceGxmVertexAttribute{
-                streamIndex: 0,
-                offset: 8,
-                format: SCE_GXM_ATTRIBUTE_FORMAT_U8 as u8,
-                componentCount: 4,
-                regIndex: 0,
-            }, "aColor")
-        ];
+        let position_attr = (SceGxmVertexAttribute{
+            streamIndex: 0,
+            offset: 0,
+            format: SCE_GXM_ATTRIBUTE_FORMAT_F32 as u8,
+            componentCount: 2,
+            regIndex: 0,
+        }, "aPosition");
+        
+        let color_attr = (SceGxmVertexAttribute{
+            streamIndex: 0,
+            offset: 8,
+            format: SCE_GXM_ATTRIBUTE_FORMAT_U8 as u8,
+            componentCount: 4,
+            regIndex: 0,
+        }, "aColor");
 
-        let color_vertex_shader = shader_registry.register_vertex_shader(
-            "color",
-            COLOR_VERTEX_GXP,
-            vertex_stride,
-            &vertex_attributes
+        let color_vertex_shader = shader_registry.register_vertex_shader::<VertexColor>(
+            "color", COLOR_VERTEX_GXP, &[position_attr, color_attr]
         ).unwrap();
-        let texture_vertex_shader = shader_registry.register_vertex_shader(
-            "texture",
-            TEXTURE_VERTEX_GXP,
-            vertex_stride,
-            &vertex_attributes
+        let clear_vertex_shader = shader_registry.register_vertex_shader::<Vertex>(
+            "clear", CLEAR_VERTEX_GXP, &[position_attr]
         ).unwrap();
-        let clear_vertex_shader = shader_registry.register_vertex_shader(
-            "clear",
-            CLEAR_VERTEX_GXP,
-            vertex_stride,
-            &vertex_attributes
+        let texture_vertex_shader = shader_registry.register_vertex_shader::<Vertex>(
+            "texture", TEXTURE_VERTEX_GXP, &[position_attr]
         ).unwrap();
         
         let color_fragment_shader = shader_registry.register_fragment_shader("color", COLOR_FRAGMENT_GXP).unwrap();
+        let clear_fragment_shader = shader_registry.register_fragment_shader("clear", CLEAR_FRAGMENT_GXP).unwrap();
         let bitmap_fragment_shader = shader_registry.register_fragment_shader("bitmap", BITMAP_FRAGMENT_GXP).unwrap();
         let gradient_fragment_shader = shader_registry.register_fragment_shader("gradient", GRADIENT_FRAGMENT_GXP).unwrap();
-        let clear_fragment_shader = shader_registry.register_fragment_shader("clear", CLEAR_FRAGMENT_GXP).unwrap();
 
         let color_shader = shader_registry.register_shader(color_vertex_shader, color_fragment_shader).unwrap();
         let bitmap_shader = shader_registry.register_shader(texture_vertex_shader, bitmap_fragment_shader).unwrap();
         let gradient_shader = shader_registry.register_shader(texture_vertex_shader, gradient_fragment_shader).unwrap();
         let clear_shader = shader_registry.register_shader(clear_vertex_shader, clear_fragment_shader).unwrap();
 
-        let quad_verticies = gxm::Buffer::from_slice(gxm::HeapType::LPDDR_R, &[
-            Vertex {
-                position: [0.0, 0.0],
-                color: 0xffff_ffff,
-            },
-            Vertex {
-                position: [1.0, 0.0],
-                color: 0xffff_ffff,
-            },
-            Vertex {
-                position: [1.0, 1.0],
-                color: 0xffff_ffff,
-            },
-            Vertex {
-                position: [0.0, 1.0],
-                color: 0xffff_ffff,
-            },
+        let quad_verticies_color = gxm::Buffer::from_slice(
+            gxm::HeapType::LPDDR_R,
+            gxm::MemoryUsage::VertexBuffer,
+            &[
+                VertexColor { position: [0.0, 0.0], color: 0xffff_ffff },
+                VertexColor { position: [1.0, 0.0], color: 0xffff_ffff },
+                VertexColor { position: [1.0, 1.0], color: 0xffff_ffff },
+                VertexColor { position: [0.0, 1.0], color: 0xffff_ffff },
         ]);
+        
+        let quad_verticies = gxm::Buffer::from_slice(
+            gxm::HeapType::LPDDR_R,
+            gxm::MemoryUsage::VertexBuffer,
+            &[
+                Vertex { position: [0.0, 0.0] },
+                Vertex { position: [1.0, 0.0] },
+                Vertex { position: [1.0, 1.0] },
+                Vertex { position: [0.0, 1.0] },
+            ]
+        );
 
-        let quad_indicies = gxm::Buffer::from_slice(gxm::HeapType::LPDDR_R, &[0u32, 1, 2, 3]);
+        let quad_indicies = gxm::Buffer::from_slice(
+            gxm::HeapType::LPDDR_R,
+            gxm::MemoryUsage::IndexBuffer,
+            &[0u32, 1, 2, 3]
+        );
 
         let viewport = ViewportDimensions {
             width: display.width as u32,
             height: display.height as u32,
             scale_factor: 1.0,
         };
+        
+        context.set_depth_write_enable(false);
 
         let mut renderer = Self {
             context,
@@ -278,11 +288,12 @@ impl GxmRenderBackend {
             shape_tessellator: ShapeTessellator::new(),
 
             quad_verticies,
+            quad_verticies_color,
             quad_indicies,
 
             renderbuffer_width: 1,
             renderbuffer_height: 1,
-            view_matrix: [[0.0; 4]; 4],
+            projection_matrix: [[0.0; 4]; 4],
 
             mask_state: MaskState::NoMask,
             num_masks: 0,
@@ -295,6 +306,8 @@ impl GxmRenderBackend {
             viewport_scale_factor: 1.0,
             viewport,
             viewport_dirty: true,
+
+            gradient_textures: HashMap::new(),
         };
 
         renderer.push_blend_mode(RenderBlendMode::Builtin(BlendMode::Normal));
@@ -307,61 +320,79 @@ impl GxmRenderBackend {
         shape: DistilledShape,
         bitmap_source: &dyn BitmapSource,
     ) -> Result<Vec<Draw>, Error> {
-        use ruffle_render::tessellator::DrawType as TessDrawType;
-
-        let lyon_mesh = self
-            .shape_tessellator
-            .tessellate_shape(shape, bitmap_source);
+        let lyon_mesh = self.shape_tessellator.tessellate_shape(shape, bitmap_source);
 
         let mut draws = Vec::with_capacity(lyon_mesh.draws.len());
         for draw in lyon_mesh.draws {
             let num_indices = draw.indices.len() as i32;
             let num_mask_indices = draw.mask_index_count as i32;
-
-            // allocate verticies on the gpu memory
-            let mut vertices: gxm::Buffer<Vertex> = gxm::Buffer::new(
+            let index_buffer = gxm::Buffer::from_slice(
                 gxm::HeapType::LPDDR_R,
-                draw.vertices.len(),
-                4
+                gxm::MemoryUsage::IndexBuffer,
+                draw.indices.as_slice()
             );
-            let verticies_slice = vertices.as_mut_slice();
-            for (i, vertex) in draw.vertices.into_iter().map(Vertex::from).enumerate() {
-                verticies_slice[i] = vertex;
-            }
 
-            let indicies = gxm::Buffer::from_slice(gxm::HeapType::LPDDR_R, draw.indices.as_slice());
-
-            draws.push(match draw.draw_type {
-                TessDrawType::Color => Draw {
-                    draw_type: DrawType::Color,
-                    vertex_buffer: vertices,
-                    index_buffer: indicies,
-                    num_indices,
-                    num_mask_indices,
-                },
-                TessDrawType::Gradient { matrix, gradient } => Draw {
-                    draw_type: DrawType::Gradient(Box::new(Gradient::new(
-                        lyon_mesh.gradients[gradient].clone(), // TODO: Gradient deduplication
-                        matrix,
-                    ))),
-                    vertex_buffer: vertices,
-                    index_buffer: indicies,
-                    num_indices,
-                    num_mask_indices,
-                },
-                TessDrawType::Bitmap(bitmap) => Draw {
-                    draw_type: DrawType::Bitmap(BitmapDraw {
-                        matrix: bitmap.matrix,
-                        handle: bitmap_source.bitmap_handle(bitmap.bitmap_id, self),
-                        is_smoothed: bitmap.is_smoothed,
-                        is_repeating: bitmap.is_repeating,
-                    }),
-                    vertex_buffer: vertices,
-                    index_buffer: indicies,
-                    num_indices,
-                    num_mask_indices,
-                },
-            });
+            draws.push(Draw{
+                index_buffer,
+                num_indices,
+                num_mask_indices,
+                draw_type: match draw.draw_type {
+                    TessDrawType::Color => {
+                        let mut vertices = gxm::Buffer::<VertexColor>::new(
+                            gxm::HeapType::LPDDR_R,
+                            gxm::MemoryUsage::VertexBuffer,
+                            draw.vertices.len(),
+                            4
+                        );
+                        for (src, dst) in draw.vertices.into_iter().map(VertexColor::from).zip(vertices.as_mut_slice()) {
+                            *dst = src;
+                        }
+                        DrawType::Color(vertices)
+                    }
+                    TessDrawType::Gradient { matrix, gradient: gradient_index } => {
+                        let gradient = lyon_mesh.gradients[gradient_index].clone();
+                        let texture = match self.gradient_textures.entry((gradient.records.clone(), gradient.interpolation)) {
+                            Entry::Occupied(o) => Rc::clone(o.get()),
+                            Entry::Vacant(v) => {
+                                let records = v.key().0.clone();
+                                let interpolation = v.key().1;
+                                Rc::clone(v.insert(Rc::new(Gradient::gen_texture(
+                                    records,
+                                    interpolation
+                                ))))
+                            }
+                        };
+                        let mut vertices = gxm::Buffer::<Vertex>::new(
+                            gxm::HeapType::LPDDR_R,
+                            gxm::MemoryUsage::VertexBuffer,
+                            draw.vertices.len(),
+                            4
+                        );
+                        for (src, dst) in draw.vertices.into_iter().map(Vertex::from).zip(vertices.as_mut_slice()) {
+                            *dst = src;
+                        }
+                        DrawType::Gradient(Gradient::new(gradient, texture, matrix, vertices))
+                    },
+                    TessDrawType::Bitmap(bitmap) => {
+                        let mut vertices = gxm::Buffer::<Vertex>::new(
+                            gxm::HeapType::LPDDR_R,
+                            gxm::MemoryUsage::VertexBuffer,
+                            draw.vertices.len(),
+                            4
+                        );
+                        for (src, dst) in draw.vertices.into_iter().map(Vertex::from).zip(vertices.as_mut_slice()) {
+                            *dst = src;
+                        }
+                        DrawType::Bitmap(BitmapDraw {
+                            matrix: bitmap.matrix,
+                            handle: bitmap_source.bitmap_handle(bitmap.bitmap_id, self),
+                            is_smoothed: bitmap.is_smoothed,
+                            is_repeating: bitmap.is_repeating,
+                            vertices,
+                        })
+                    }
+                }
+            })
         }
 
         Ok(draws)
@@ -451,19 +482,19 @@ impl GxmRenderBackend {
 
         self.context.begin_scene(&mut self.display);
         if self.viewport_dirty {
-            //self.viewport_dirty = false;
+            self.viewport_dirty = false;
             let width = self.viewport.width as i32;
             let height = self.viewport.height as i32;
-            self.context.set_viewport(0, 0, width, height);
-
             // Build view matrix based on canvas size.
 
-            self.view_matrix = [
-                [1.0 / width as f32, 0.0, 0.0, 0.0],   // Scale X, translate X to [-1, 1]
-                [0.0, 1.0 / height as f32, 0.0, 1.0],   // Scale Y, flip Y, translate Y to [1, -1]
-                [0.0, 0.0, 1.0, 0.0],                   // No depth scaling
-                [0.0, 0.0, 0.0, 1.0],                   // Homogeneous coordinates
+            self.projection_matrix = [
+                [2.0 / (width as f32), 0.0, 0.0, 0.0],
+                [0.0, -2.0 / (height as f32), 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [-1.0, 1.0, 0.0, 1.0],
             ];
+
+            self.context.set_viewport(0, 0, width, height);
         }
 
         self.set_stencil_state();
@@ -512,9 +543,11 @@ impl GxmRenderBackend {
     }
 
     fn clear_screen(&mut self, clear: Color) {
+        self.context.push_marker("clear_screen");
+
         let program = self.use_shader_program(ShaderProgramType::Clear);
 
-        program.uniform4fv(ShaderUniform::Color, &[clear.r as f32, clear.g as f32, clear.b as f32, 1.]);
+        program.uniform4fv(ShaderUniform::AddColor, &[clear.r as f32 / 255., clear.g as f32 / 255., clear.b as f32 / 255., 1.]);
 
         self.context.set_vertex_stream(&self.quad_verticies);
 
@@ -524,20 +557,20 @@ impl GxmRenderBackend {
             &self.quad_indicies,
             0
         );
+
+        self.context.pop_marker();
     }
 
     fn draw_quad<const MODE: u32, const COUNT: i32>(&mut self, color: Color, matrix: Matrix) {
+        let tx = matrix.tx.to_pixels() as f32;
+        let ty = matrix.ty.to_pixels() as f32;
         let world_matrix = [
             [matrix.a, matrix.b, 0.0, 0.0],
             [matrix.c, matrix.d, 0.0, 0.0],
             [0.0, 0.0, 1.0, 0.0],
-            [
-                matrix.tx.to_pixels() as f32,
-                matrix.ty.to_pixels() as f32,
-                0.0,
-                1.0,
-            ],
+            [tx, ty, 0.0, 1.0],
         ];
+        let wvp_matrix = simd_matmul(world_matrix, self.projection_matrix);
 
         let mult_color = [
             color.r as f32,
@@ -547,26 +580,25 @@ impl GxmRenderBackend {
         ];
         let add_color = [0.0; 4];
 
+        self.context.push_marker("draw_quad");
+
         self.set_stencil_state();
 
         let program = self.use_shader_program(ShaderProgramType::Color);
 
-        program.uniform_matrix4fv(ShaderUniform::ViewMatrix, &self.view_matrix);
-
-        program.uniform_matrix4fv(ShaderUniform::WorldMatrix, &world_matrix);
-
+        program.uniform_matrix4fv(ShaderUniform::WorldViewProjectionMatrix, &wvp_matrix);
         program.uniform4fv(ShaderUniform::MultColor, &mult_color);
-
         program.uniform4fv(ShaderUniform::AddColor, &add_color);
-
+        
         self.context.set_vertex_stream(&self.quad_verticies);
-
         self.context.draw(
             MODE,
             SCE_GXM_INDEX_FORMAT_U32,
             &self.quad_indicies,
             COUNT.max(0) as usize
         );
+
+        self.context.pop_marker();
     }
 }
 
@@ -597,18 +629,11 @@ impl RenderBackend for GxmRenderBackend {
     }
 
     fn set_viewport_dimensions(&mut self, dimensions: ViewportDimensions) {
-        println!("set_viewport_dimensions {:#?}", dimensions);
-
-        // Setup GL viewport and renderbuffers clamped to reasonable sizes.
-        // We don't use `.clamp()` here because `self.gl.drawing_buffer_width()` and
-        // `self.gl.drawing_buffer_height()` return zero when the WebGL context is lost,
-        // then an assertion error would be triggered.
         self.renderbuffer_width =
             (dimensions.width.max(1) as i32).min(self.display.width as i32);
         self.renderbuffer_height =
             (dimensions.height.max(1) as i32).min(self.display.height as i32);
 
-        // Recreate framebuffers with the new size.
         self.viewport = dimensions;
         self.viewport_dirty = true;
         self.viewport_scale_factor = dimensions.scale_factor
@@ -753,7 +778,7 @@ impl RenderBackend for GxmRenderBackend {
         height: u32,
     ) -> Result<BitmapHandle, BitmapError> {
         let mut texture_data: Vec<u8> = Vec::new();
-        texture_data.resize((width*height*3) as usize, 0);
+        texture_data.resize((width*height*4) as usize, 0);
 
         let texture = gxm::Texture::new(
             width,
@@ -778,6 +803,8 @@ impl CommandHandler for GxmRenderBackend {
         smoothing: bool,
         pixel_snapping: PixelSnapping,
     ) {
+        self.context.push_marker("render_bitmap");
+
         self.set_stencil_state();
         let entry = as_registry_data(&bitmap);
 
@@ -786,24 +813,23 @@ impl CommandHandler for GxmRenderBackend {
         pixel_snapping.apply(&mut matrix);
         matrix *= Matrix::scale(entry.width as f32, entry.height as f32);
 
+        let tx = matrix.tx.to_pixels() as f32;
+        let ty = matrix.ty.to_pixels() as f32;
         let world_matrix = [
-            [matrix.a, matrix.c, 0.0, matrix.tx.to_pixels() as f32], // First row: scale_x, rotate_skew_1, z=0, translate_x
-            [matrix.b, matrix.d, 0.0, matrix.ty.to_pixels() as f32], // Second row: rotate_skew_0, scale_y, z=0, translate_y
-            [0.0, 0.0, 1.0, 0.0],                                  // Third row: no transformation in z-axis
-            [0.0, 0.0, 0.0, 1.0],                                  // Fourth row: homogeneous coordinates
+            [transform.matrix.a, transform.matrix.b, 0.0, 0.0],
+            [transform.matrix.c, transform.matrix.d, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [tx, ty, 0.0, 1.0],
         ];
+        let wvp_matrix = simd_matmul(world_matrix, self.projection_matrix);
 
         let mult_color = transform.color_transform.mult_rgba_normalized();
         let add_color = transform.color_transform.add_rgba_normalized();
 
         let program = self.use_shader_program(ShaderProgramType::Bitmap);
 
-        program.uniform_matrix4fv(ShaderUniform::ViewMatrix, &self.view_matrix);
-
-        program.uniform_matrix4fv(ShaderUniform::WorldMatrix, &world_matrix);
-
+        program.uniform_matrix4fv(ShaderUniform::WorldViewProjectionMatrix, &wvp_matrix);
         program.uniform4fv(ShaderUniform::MultColor, &mult_color);
-
         program.uniform4fv(ShaderUniform::AddColor, &add_color);
 
         let bitmap_matrix: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
@@ -822,35 +848,35 @@ impl CommandHandler for GxmRenderBackend {
             &self.quad_indicies,
             0
         );
+
+        self.context.pop_marker();
     }
 
     fn render_shape(&mut self, shape: ShapeHandle, transform: Transform) {
+        let tx = transform.matrix.tx.to_pixels() as f32;
+        let ty = transform.matrix.ty.to_pixels() as f32;
+
         let world_matrix = [
             [transform.matrix.a, transform.matrix.b, 0.0, 0.0],
             [transform.matrix.c, transform.matrix.d, 0.0, 0.0],
             [0.0, 0.0, 1.0, 0.0],
-            [
-                transform.matrix.tx.to_pixels() as f32,
-                transform.matrix.ty.to_pixels() as f32,
-                0.0,
-                1.0,
-            ],
+            [tx, ty, 0.0, 1.0],
         ];
+        let wvp_matrix = simd_matmul(world_matrix, self.projection_matrix);
 
         let mult_color = transform.color_transform.mult_rgba_normalized();
         let add_color = transform.color_transform.add_rgba_normalized();
+
+        self.context.push_marker("render_shape");
 
         self.set_stencil_state();
 
         let mesh = as_mesh(&shape);
         for draw in &mesh.draws {
             // Ignore strokes when drawing a mask stencil.
-            let num_indices = if self.mask_state != MaskState::DrawMaskStencil
-                && self.mask_state != MaskState::ClearMaskStencil
-            {
-                draw.num_indices
-            } else {
-                draw.num_mask_indices
+            let num_indices = match self.mask_state {
+                MaskState::DrawMaskStencil | MaskState::ClearMaskStencil => draw.num_mask_indices,
+                _ => draw.num_indices,
             };
             if num_indices == 0 {
                 continue;
@@ -858,17 +884,15 @@ impl CommandHandler for GxmRenderBackend {
 
             let program = self.use_shader_program(ShaderProgramType::from_draw_type(&draw.draw_type));
 
-            program.uniform_matrix4fv(ShaderUniform::ViewMatrix, &self.view_matrix);
-
-            program.uniform_matrix4fv(ShaderUniform::WorldMatrix, &world_matrix);
-
+            program.uniform_matrix4fv(ShaderUniform::WorldViewProjectionMatrix, &wvp_matrix);
             program.uniform4fv(ShaderUniform::MultColor, &mult_color);
-
             program.uniform4fv(ShaderUniform::AddColor, &add_color);
 
             // Set shader specific uniforms.
             match &draw.draw_type {
-                DrawType::Color => (),
+                DrawType::Color(vertices) => {
+                    self.context.set_vertex_stream(&vertices);
+                },
                 DrawType::Gradient(gradient) => {
                     program.uniform_matrix3fv(
                         ShaderUniform::TextureMatrix,
@@ -880,8 +904,9 @@ impl CommandHandler for GxmRenderBackend {
                         gradient.gradient_type as u8, // y
                         gradient.repeat_mode as u8, // z
                     ]);
+
                     self.context.set_texture(&gradient.texture);
-                    //program.dump_uniform_data();
+                    self.context.set_vertex_stream(&gradient.vertices);
                 }
                 DrawType::Bitmap(bitmap) => {
                     let texture = match &bitmap.handle {
@@ -902,17 +927,19 @@ impl CommandHandler for GxmRenderBackend {
                     texture.set_filter(filter, filter);
                     let wrap = if bitmap.is_repeating { SCE_GXM_TEXTURE_ADDR_REPEAT } else { SCE_GXM_TEXTURE_ADDR_CLAMP };
                     texture.set_addr_mode(wrap);
+                    self.context.set_vertex_stream(&bitmap.vertices);
                 }
             }
 
-            self.context.set_vertex_stream(&draw.vertex_buffer);
             self.context.draw(
                 SCE_GXM_PRIMITIVE_TRIANGLES,
                 SCE_GXM_INDEX_FORMAT_U32,
                 &draw.index_buffer,
-                0
+                draw.index_buffer.len
             );
         }
+
+        self.context.pop_marker();
     }
 
     fn render_stage3d(&mut self, _bitmap: BitmapHandle, _transform: Transform) {
@@ -926,13 +953,13 @@ impl CommandHandler for GxmRenderBackend {
     fn draw_line(&mut self, color: Color, mut matrix: Matrix) {
         matrix.tx += Twips::HALF;
         matrix.ty += Twips::HALF;
-        self.draw_quad::<{  SCE_GXM_PRIMITIVE_LINES /*gl::LINE_STRIP*/ }, 2>(color, matrix)
+        //self.draw_quad::<{  SCE_GXM_PRIMITIVE_LINES /*gl::LINE_STRIP*/ }, 2>(color, matrix)
     }
 
     fn draw_line_rect(&mut self, color: Color, mut matrix: Matrix) {
         matrix.tx += Twips::HALF;
         matrix.ty += Twips::HALF;
-        self.draw_quad::<{ SCE_GXM_PRIMITIVE_LINES /*gl::LINE_LOOP*/ }, -1>(color, matrix)
+        //self.draw_quad::<{ SCE_GXM_PRIMITIVE_LINES /*gl::LINE_LOOP*/ }, -1>(color, matrix)
     }
 
     fn push_mask(&mut self) {
@@ -981,7 +1008,8 @@ struct Gradient {
     repeat_mode: i32,
     focal_point: f32,
     interpolation: swf::GradientInterpolation,
-    texture: gxm::Texture,
+    texture: Rc<gxm::Texture>,
+    vertices: gxm::Buffer<Vertex>,
 }
 
 const GRADIENT_SIZE: usize = 0x100;
@@ -999,13 +1027,13 @@ fn srgb_to_linear(color: f32) -> f32 {
 }
 
 impl Gradient {
-    fn new(gradient: TessGradient, matrix: [[f32; 3]; 3]) -> Self {
-        let colors = if gradient.records.is_empty() {
+    fn gen_texture(records: Vec<swf::GradientRecord>, interpolation: swf::GradientInterpolation) -> gxm::Texture {
+        let colors = if records.is_empty() {
             [0; GRADIENT_SIZE * 4]
         } else {
             let mut colors = [0; GRADIENT_SIZE * 4];
 
-            let convert = if gradient.interpolation == swf::GradientInterpolation::LinearRgb {
+            let convert = if interpolation == swf::GradientInterpolation::LinearRgb {
                 |c| srgb_to_linear(c / 255.0) * 255.0
             } else {
                 |c| c
@@ -1015,17 +1043,17 @@ impl Gradient {
                 let mut last = 0;
                 let mut next = 0;
 
-                for (i, record) in gradient.records.iter().enumerate().rev() {
+                for (i, record) in records.iter().enumerate().rev() {
                     if (record.ratio as usize) < t {
                         last = i;
-                        next = (i + 1).min(gradient.records.len() - 1);
+                        next = (i + 1).min(records.len() - 1);
                         break;
                     }
                 }
                 assert!(last == next || last + 1 == next);
 
-                let last_record = &gradient.records[last];
-                let next_record = &gradient.records[next];
+                let last_record = &records[last];
+                let next_record = &records[next];
 
                 let a = if next == last {
                     // this can happen if we are before the first gradient record, or after the last one
@@ -1059,13 +1087,14 @@ impl Gradient {
             colors
         };
 
-        let texture = gxm::Texture::new(
-            GRADIENT_SIZE as u32,
-            1,
+        gxm::Texture::new(
+            GRADIENT_SIZE as u32, 1,
             SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_RGBA,
             &colors
-        );
+        )
+    }
 
+    fn new(gradient: TessGradient, texture: Rc<gxm::Texture>, matrix: [[f32; 3]; 3], vertices: gxm::Buffer<Vertex>) -> Self {
         Self {
             matrix,
             gradient_type: gradient.gradient_type as i32,
@@ -1073,6 +1102,7 @@ impl Gradient {
             focal_point: gradient.focal_point.to_f32().clamp(-0.98, 0.98),
             interpolation: gradient.interpolation,
             texture,
+            vertices,
         }
     }
 }
@@ -1083,6 +1113,7 @@ struct BitmapDraw {
     handle: Option<BitmapHandle>,
     is_repeating: bool,
     is_smoothed: bool,
+    vertices: gxm::Buffer<Vertex>,
 }
 
 #[derive(Debug)]
@@ -1093,7 +1124,7 @@ struct Mesh {
 impl ShapeHandleImpl for Mesh {}
 
 fn as_mesh(handle: &ShapeHandle) -> &Mesh {
-    <dyn ShapeHandleImpl>::downcast_ref(&*handle.0).expect("Shape handle must be a GXM.ofw ShapeData")
+    <dyn ShapeHandleImpl>::downcast_ref(&*handle.0).expect("Shape handle must be a GXM ShapeData")
 }
 
 
@@ -1101,7 +1132,6 @@ fn as_mesh(handle: &ShapeHandle) -> &Mesh {
 #[derive(Debug)]
 struct Draw {
     draw_type: DrawType,
-    vertex_buffer: gxm::Buffer<Vertex>,
     index_buffer: gxm::Buffer<u32>,
     num_indices: i32,
     num_mask_indices: i32,
@@ -1109,8 +1139,8 @@ struct Draw {
 
 #[derive(Debug)]
 enum DrawType {
-    Color,
-    Gradient(Box<Gradient>),
+    Color(gxm::Buffer<VertexColor>),
+    Gradient(Gradient),
     Bitmap(BitmapDraw),
 }
 
@@ -1118,14 +1148,14 @@ enum ShaderProgramType {
     Color,
     Bitmap,
     Gradient,
-    Clear
+    Clear,
 }
 
 impl ShaderProgramType {
     fn from_draw_type(draw_type: &DrawType) -> ShaderProgramType {
         match draw_type {
             DrawType::Bitmap(..) => ShaderProgramType::Bitmap,
-            DrawType::Color => ShaderProgramType::Color,
+            DrawType::Color(_) => ShaderProgramType::Color,
             DrawType::Gradient(_) => ShaderProgramType::Gradient,
         }
     }
@@ -1140,27 +1170,23 @@ struct ShaderProgram {
 }
 
 // These should match the uniform names in the shaders.
-const NUM_UNIFORMS: usize = 8;
+const NUM_UNIFORMS: usize = 6;
 const UNIFORM_NAMES: [&str; NUM_UNIFORMS] = [
-    "worldMatrix",
-    "viewMatrix",
+    "wvp",
     "multColor",
     "addColor",
     "uMatrix",
-    "focal_point",
+    "focalPoint",
     "gradient",
-    "uColor",
 ];
 
 enum ShaderUniform {
-    WorldMatrix = 0,
-    ViewMatrix,
+    WorldViewProjectionMatrix = 0,
     MultColor,
     AddColor,
     TextureMatrix,
     FocalPoint,
-    Gradient,
-    Color
+    Gradient
 }
 
 impl ShaderProgram {
@@ -1169,7 +1195,7 @@ impl ShaderProgram {
         uniform_buffers: gxm::UniformBuffers
     ) -> Result<Self, Error> {
         Ok(ShaderProgram {
-            program: program,
+            program,
             uniform_buffers
         })
     }
@@ -1178,22 +1204,6 @@ impl ShaderProgram {
         self.program.as_ref().set_uniform(
             uniform as usize,
             &[value],
-            self.uniform_buffers,
-        );
-    }
-
-    fn uniform1fv(&self, uniform: ShaderUniform, values: &[f32]) {
-        self.program.set_uniform(
-            uniform as usize,
-            values,
-            self.uniform_buffers,
-        );
-    }
-
-    fn uniform1i(&self, uniform: ShaderUniform, value: u32) {
-        self.program.set_uniform(
-            uniform as usize,
-            &[f32::from_bits(value)],
             self.uniform_buffers,
         );
     }
@@ -1226,6 +1236,7 @@ impl ShaderProgram {
         self.program.set_uniform_data(uniform as usize, value, self.uniform_buffers);
     }
 
+    #[allow(unused)]
     fn dump_uniform_data(&self) {
         self.program.dump_uniform_data(self.uniform_buffers);
     }

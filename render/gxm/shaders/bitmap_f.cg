@@ -12,7 +12,7 @@ void main(
     // Unmultiply alpha before applying color transform.
     if (fragColor.a > 0.0) {
         fragColor.rgb /= fragColor.a;
-        fragColor = saturate(multColor * fragColor + addColor);
-        fragColor.rgb = fragColor.rgb * saturate(fragColor.a);
+        fragColor = clamp(multColor * fragColor + addColor, 0.0, 1.0);
+        fragColor.rgb = fragColor.rgb * clamp(fragColor.a, 0.0, 1.0);
     }
 }

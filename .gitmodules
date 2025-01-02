@@ -1,0 +1,6 @@
+[submodule "vita/hyper-util"]
+	path = vita/hyper-util
+	url = https://github.com/olebeck/hyper-util
+[submodule "vita/rlsf"]
+	path = vita/rlsf
+	url = https://github.com/olebeck/rlsf
